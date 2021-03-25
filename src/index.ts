@@ -7,11 +7,11 @@
  *
  */
 
-var inherits = require("util").inherits;
-var deprecate = require("util-deprecate");
-var EventEmitter = require("events").EventEmitter;
-var Decoder = require("string_decoder").StringDecoder;
-var Readable = require("stream").Readable;
+import deprecate from "https://cdn.skypack.dev/util-deprecate";
+import Readable from "https://deno.land/std@0.91.0/node/_stream/readable.ts";
+import { EventEmitter } from "https://deno.land/std@0.91.0/node/events.ts";
+import Decoder from "https://deno.land/std@0.91.0/node/string_decoder.ts";
+import Nil = Highland.Nil;
 
 /**
  * The Stream constructor, accepts an array of values or a generator function
@@ -175,17 +175,19 @@ var Readable = require("stream").Readable;
  * //=> [ 1, 2, 3, 4]
  */
 
-/*eslint-disable no-multi-spaces */
-exports = module.exports = function (
-  /*optional*/ xs,
-  /*optional*/ secondArg,
-  /*optional*/ mappingHint,
-) {
-  /*eslint-enable no-multi-spaces */
+const _ = <R>(
+  xs?: Stream<R> | Array<R>,
+  secondArg?: any,
+  mappingHint?: any,
+) => {
+  if (xs && isStream(xs)) {
+    // already a Stream
+    return xs;
+  }
   return new Stream(xs, secondArg, mappingHint);
 };
 
-var _ = exports;
+export default _;
 
 // Create quick slice reference variable for speed
 var slice = Array.prototype.slice;
@@ -207,25 +209,11 @@ function bindContext(fn, context) {
   }
 }
 
-_.isUndefined = function (x) {
-  return typeof x === "undefined";
-};
-
-_.isFunction = function (x) {
-  return typeof x === "function";
-};
-
-_.isObject = function (x) {
-  return typeof x === "object" && x !== null;
-};
-
-_.isString = function (x) {
-  return typeof x === "string";
-};
-
-_.isArray = Array.isArray || function (x) {
-  return Object.prototype.toString.call(x) === "[object Array]";
-};
+export const isUndefined = (x: any): x is undefined => typeof x === "undefined";
+export const isFunction = (x: any): x is Function => typeof x === "function";
+export const isObject = (x: any): x is object =>
+  typeof x === "object" && x !== null;
+export const isString = (x: any): x is string => typeof x === "string";
 
 // setImmediate browser fallback
 if (typeof setImmediate === "undefined") {
@@ -252,7 +240,7 @@ if (typeof setImmediate === "undefined") {
  *
  * @id nil
  * @section Utils
- * @name _.nil
+ * @name nil
  * @api public
  *
  * var map = function (iter, source) {
@@ -261,7 +249,7 @@ if (typeof setImmediate === "undefined") {
  *             push(err);
  *             next();
  *         }
- *         else if (val === _.nil) {
+ *         else if (val === nil) {
  *             push(null, val);
  *         }
  *         else {
@@ -272,18 +260,7 @@ if (typeof setImmediate === "undefined") {
  * };
  */
 
-// set up a global nil object in cases where you have multiple Highland
-// instances installed (often via npm)
-var _global = this;
-if (typeof global !== "undefined") {
-  _global = global;
-} else if (typeof window !== "undefined") {
-  _global = window;
-}
-if (!_global.nil) {
-  _global.nil = {};
-}
-var nil = _.nil = _global.nil;
+export const nil: Nil = Symbol("nil");
 
 /**
  * Transforms a function with specific arity (all arguments must be
@@ -474,7 +451,7 @@ function pipeReadable(xs, onFinish, stream) {
   var cleanup = null;
   var endOnError = true;
 
-  if (_.isFunction(response)) {
+  if (isFunction(response)) {
     cleanup = response;
   } else if (response != null) {
     cleanup = response.onDestroy;
@@ -544,7 +521,7 @@ function promiseStream(promise) {
 
     // Using finally also handles bluebird promise cancellation, so we do
     // it if we can.
-    if (_.isFunction(promise["finally"])) { // eslint-disable-line dot-notation
+    if (isFunction(promise["finally"])) { // eslint-disable-line dot-notation
       promise["finally"](function () { // eslint-disable-line dot-notation
         if (!nilScheduled) {
           _.setImmediate(function () {
@@ -568,16 +545,16 @@ function iteratorStream(it) {
 
     if (iterErr) {
       push(iterErr);
-      push(null, _.nil);
+      push(null, nil);
     } else if (iterElem.done) {
-      if (!_.isUndefined(iterElem.value)) {
+      if (!isUndefined(iterElem.value)) {
         // generators can return a final
         // value on completion using return
         // keyword otherwise value will be
         // undefined
         push(null, iterElem.value);
       }
-      push(null, _.nil);
+      push(null, nil);
     } else {
       push(null, iterElem.value);
       next();
@@ -668,180 +645,238 @@ function pipeStream(src, dest, write, end, passAlongErrors) {
   }
 }
 
-function generatorPush(stream, write) {
+const generatorPush = (stream: Stream, write?) => {
   if (!write) {
     write = stream.write;
   }
 
-  return function (err, x) {
+  return function (err?: Error, x) {
     // This will set _nil_pushed if necessary.
     write.call(stream, err ? new StreamError(err) : x);
   };
-}
+};
 
 /**
  * Actual Stream constructor wrapped the the main exported function
  */
 
-/*eslint-disable no-multi-spaces */
-function Stream(
-  /*optional*/ xs,
-  /*optional*/ secondArg,
-  /*optional*/ mappingHint,
-) {
-  /*eslint-enable no-multi-spaces */
-  if (xs && _.isStream(xs)) {
-    // already a Stream
-    return xs;
+class Stream<T> extends EventEmitter {
+  /**
+   * used to detect Highland Streams using isStream(x), this
+   * will work even in cases where npm has installed multiple
+   * versions, unlike an instanceof check
+   */
+  private __HighlandStream__: boolean = true;
+  id: string = ("" + Math.random()).substr(2, 6);
+  paused: boolean = true;
+  private _incoming: Array<T | Nil> = [];
+  private _generator?: Function;
+  private _outgoing: Array<void> = [];
+  private _consumers: Array<void> = [];
+  private _observers: Array<void> = [];
+  private _destructors: Array<void> = [];
+  private _send_events: boolean = false;
+  private _nil_pushed: boolean = false;
+  private _is_observer: boolean = false;
+  private _in_consume_cb: boolean = false;
+  private _repeat_resume: boolean = false;
+  private _delegate: null = null;
+  source: null = null;
+  /** Old-style node Stream.pipe() checks for this */
+  writable: boolean = true;
+  /**
+   * Signals whether or not a call to write() returned false, and thus we can drain.
+   * This is only relevant for streams constructed with _().
+   * @private
+   */
+  private _can_drain: boolean = false;
+  /**
+   * Used by consume() to signal that next() hasn't been called, so resume()
+   * shouldn't ask for more data. Backpressure handling is getting fairly
+   * complicated, and this is very much a hack to get consume() backpressure
+   * to work correctly.
+   */
+  private _consume_waiting_for_next: boolean = false;
+  /**
+   * Writes a value to the Stream. If the Stream is paused it will go into the
+   * Stream's incoming buffer, otherwise it will be immediately processed and
+   * sent to the Stream's consumers (if any). Returns false if the Stream is
+   * paused, true otherwise. This lets Node's pipe method handle back-pressure.
+   *
+   * You shouldn't need to call this yourself, but it may be called by Node
+   * functions which treat Highland Streams as a [Node Writable Stream](http://nodejs.org/api/stream.html#stream_class_stream_writable).
+   *
+   * Only call this function on streams that were constructed with no source
+   * (i.e., with `_()`).
+
+   * @id write
+   * @section Stream Objects
+   * @name Stream.write(x)
+   * @param x - the value to write to the Stream
+   * @api public
+   *
+   * var xs = _();
+   * xs.write(1);
+   * xs.write(2);
+   * xs.end();
+   *
+   * xs.toArray(function (ys) {
+   *     // ys will be [1, 2]
+   * });
+   *
+   * // Do *not* do this.
+   * var xs2 = _().toArray(_.log);
+   * xs2.write(1); // This call is illegal.
+   */
+  write(x: T): boolean {
+    if (this._nil_pushed) {
+      throw new Error("Cannot write to stream after nil");
+    }
+
+    // The check for _is_consumer is kind of a hack. Not
+    // needed in v3.0.
+    if (x === nil && !this._is_consumer) {
+      this._nil_pushed = true;
+    }
+
+    if (this.paused) {
+      this._incoming.push(x);
+    } else {
+      if (_._isStreamError(x)) {
+        this._send(x.error);
+      } else {
+        this._send(null, x);
+      }
+    }
+
+    if (this.paused) {
+      this._can_drain = true;
+    }
+
+    return !this.paused;
   }
+  constructor(
+    xs?: Stream<T> | Array<T> | Function,
+    secondArg?: any,
+    mappingHint?: any,
+  ) {
+    super();
 
-  EventEmitter.call(this);
-  var self = this;
-
-  // used to detect Highland Streams using isStream(x), this
-  // will work even in cases where npm has installed multiple
-  // versions, unlike an instanceof check
-  self.__HighlandStream__ = true;
-
-  self.id = ("" + Math.random()).substr(2, 6);
-  this.paused = true;
-  this._incoming = [];
-  this._outgoing = [];
-  this._consumers = [];
-  this._observers = [];
-  this._destructors = [];
-  this._send_events = false;
-  this._nil_pushed = false;
-  this._delegate = null;
-  this._is_observer = false;
-  this._in_consume_cb = false;
-  this._repeat_resume = false;
-
-  // Signals whether or not a call to write() returned false, and thus we can
-  // drain. This is only relevant for streams constructed with _().
-  this._can_drain = false;
-
-  // Used by consume() to signal that next() hasn't been called, so resume()
-  // shouldn't ask for more data. Backpressure handling is getting fairly
-  // complicated, and this is very much a hack to get consume() backpressure
-  // to work correctly.
-  this._consume_waiting_for_next = false;
-  this.source = null;
-
-  // Old-style node Stream.pipe() checks for this
-  this.writable = true;
-
-  self.on("newListener", function (ev) {
-    if (ev === "data") {
-      self._send_events = true;
-      _.setImmediate(bindContext(self.resume, self));
-    } else if (ev === "end") {
-      // this property avoids us checking the length of the
-      // listners subscribed to each event on each _send() call
-      self._send_events = true;
-    }
-  });
-
-  // TODO: write test to cover this removeListener code
-  self.on("removeListener", function (ev) {
-    if (ev === "end" || ev === "data") {
-      var end_listeners = self.listeners("end").length;
-      var data_listeners = self.listeners("data").length;
-      if (end_listeners + data_listeners === 0) {
-        // stop emitting events
-        self._send_events = false;
+    this.on("newListener", (ev) => {
+      if (ev === "data") {
+        this._send_events = true;
+        _.setImmediate(bindContext(this.resume, this));
+      } else if (ev === "end") {
+        // this property avoids us checking the length of the
+        // listners subscribed to each event on each _send() call
+        this._send_events = true;
       }
-    }
-  });
+    });
 
-  if (_.isUndefined(xs)) {
-    // nothing else to do
-    return this;
-  } else if (_.isArray(xs)) {
-    self._incoming = xs.concat([nil]);
-    return this;
-  } else if (_.isFunction(xs)) {
-    this._generator = xs;
-    this._generator_push = generatorPush(this);
-    this._generator_next = function (s) {
-      if (self._nil_pushed) {
-        throw new Error("Cannot call next after nil");
-      }
-
-      if (s) {
-        // we MUST pause to get the redirect object into the _incoming
-        // buffer otherwise it would be passed directly to _send(),
-        // which does not handle StreamRedirect objects!
-        var _paused = self.paused;
-        if (!_paused) {
-          self.pause();
+    // TODO: write test to cover this removeListener code
+    this.on("removeListener", (ev) => {
+      if (ev === "end" || ev === "data") {
+        const end_listeners = this.listeners("end").length;
+        const data_listeners = this.listeners("data").length;
+        if (end_listeners + data_listeners === 0) {
+          // stop emitting events
+          this._send_events = false;
         }
-        self.write(new StreamRedirect(s));
-        if (!_paused) {
+      }
+    });
+
+    if (isUndefined(xs)) {
+      // nothing else to do
+      return;
+    } else if (Array.isArray(xs)) {
+      this._incoming = [...xs, nil];
+      return;
+    } else if (isFunction(xs)) {
+      this._generator = xs;
+      this._generator_push = generatorPush(this);
+      this._generator_next = function (s) {
+        if (self._nil_pushed) {
+          throw new Error("Cannot call next after nil");
+        }
+
+        if (s) {
+          // we MUST pause to get the redirect object into the _incoming
+          // buffer otherwise it would be passed directly to _send(),
+          // which does not handle StreamRedirect objects!
+          var _paused = self.paused;
+          if (!_paused) {
+            self.pause();
+          }
+          self.write(new StreamRedirect(s));
+          if (!_paused) {
+            self._resume(false);
+          }
+        } else {
+          self._generator_running = false;
+        }
+        if (!self.paused) {
           self._resume(false);
         }
-      } else {
-        self._generator_running = false;
-      }
-      if (!self.paused) {
-        self._resume(false);
-      }
-    };
+      };
 
-    return this;
-  } else if (_.isObject(xs)) {
-    // check to see if we have a readable stream
-    if (_.isFunction(xs.on) && _.isFunction(xs.pipe)) {
-      var onFinish = _.isFunction(secondArg)
-        ? secondArg
-        : defaultReadableOnFinish;
-      pipeReadable(xs, onFinish, self);
       return this;
-    } else if (_.isFunction(xs.then)) {
-      //probably a promise
-      return promiseStream(xs);
-    } // must check iterators and iterables in this order
-    // because generators are both iterators and iterables:
-    // their Symbol.iterator method returns the `this` object
-    // and an infinite loop would result otherwise
-    else if (_.isFunction(xs.next)) {
-      //probably an iterator
-      return iteratorStream(xs);
-    } else if (!_.isUndefined(_global.Symbol) && xs[_global.Symbol.iterator]) {
-      //probably an iterable
-      return iteratorStream(xs[_global.Symbol.iterator]());
+    } else if (isObject(xs)) {
+      // check to see if we have a readable stream
+      if (isFunction(xs.on) && isFunction(xs.pipe)) {
+        var onFinish = isFunction(secondArg)
+          ? secondArg
+          : defaultReadableOnFinish;
+        pipeReadable(xs, onFinish, self);
+        return this;
+      } else if (isFunction(xs.then)) {
+        //probably a promise
+        return promiseStream(xs);
+      } // must check iterators and iterables in this order
+      // because generators are both iterators and iterables:
+      // their Symbol.iterator method returns the `this` object
+      // and an infinite loop would result otherwise
+      else if (isFunction(xs.next)) {
+        //probably an iterator
+        return iteratorStream(xs);
+      } else if (
+        !isUndefined(_global.Symbol) && xs[_global.Symbol.iterator]
+      ) {
+        //probably an iterable
+        return iteratorStream(xs[_global.Symbol.iterator]());
+      } else {
+        throw new Error(
+          "Object was not a stream, promise, iterator or iterable: " +
+            (typeof xs),
+        );
+      }
+    } else if (isString(xs)) {
+      var mapper = hintMapper(mappingHint);
+
+      var callback_func = function () {
+        var ctx = mapper.apply(this, arguments);
+        self.write(ctx);
+      };
+
+      secondArg.on(xs, callback_func);
+      var removeMethod = secondArg.removeListener || // EventEmitter
+        secondArg.unbind; // jQuery
+
+      if (removeMethod) {
+        this._destructors.push(function () {
+          removeMethod.call(secondArg, xs, callback_func);
+        });
+      }
+
+      return this;
     } else {
       throw new Error(
-        "Object was not a stream, promise, iterator or iterable: " +
-          (typeof xs),
+        "Unexpected argument type to Stream(): " + (typeof xs),
       );
     }
-  } else if (_.isString(xs)) {
-    var mapper = hintMapper(mappingHint);
-
-    var callback_func = function () {
-      var ctx = mapper.apply(this, arguments);
-      self.write(ctx);
-    };
-
-    secondArg.on(xs, callback_func);
-    var removeMethod = secondArg.removeListener || // EventEmitter
-      secondArg.unbind; // jQuery
-
-    if (removeMethod) {
-      this._destructors.push(function () {
-        removeMethod.call(secondArg, xs, callback_func);
-      });
-    }
-
-    return this;
-  } else {
-    throw new Error(
-      "Unexpected argument type to Stream(): " + (typeof xs),
-    );
   }
 }
-inherits(Stream, EventEmitter);
+
+/*eslint-disable no-multi-spaces */
 
 /**
  * Creates a stream that sends a single value then ends.
@@ -878,7 +913,7 @@ _.of = function (x) {
 _.fromError = function (error) {
   return _(function (push) {
     push(error);
-    push(null, _.nil);
+    push(null, nil);
   });
 };
 
@@ -900,18 +935,26 @@ function exposeMethod(name) {
  * Used as an Error marker when writing to a Stream's incoming buffer
  */
 
-function StreamError(err) {
-  this.__HighlandStreamError__ = true;
-  this.error = err;
+class StreamError {
+  __HighlandStreamError__ = true;
+  error: Error;
+
+  constructor(err: Error) {
+    this.error = err;
+  }
 }
 
 /**
  * Used as a Redirect marker when writing to a Stream's incoming buffer
  */
 
-function StreamRedirect(to) {
-  this.__HighlandStreamRedirect__ = true;
-  this.to = to;
+class StreamRedirect {
+  __HighlandStreamRedirect__ = true;
+  to: Stream;
+
+  constructor(to: Stream) {
+    this.to = to;
+  }
 }
 
 /**
@@ -925,7 +968,7 @@ function StreamRedirect(to) {
  */
 
 _.isNil = function (x) {
-  return x === _.nil;
+  return x === nil;
 };
 
 /**
@@ -942,17 +985,14 @@ _.isNil = function (x) {
  * _.isStream(_([1,2,3]))  // => true
  */
 
-_.isStream = function (x) {
-  return _.isObject(x) && !!x.__HighlandStream__;
-};
+export const isStream = (x: any): x is Stream =>
+  isObject(x) && !!x.__HighlandStream__;
 
-_._isStreamError = function (x) {
-  return _.isObject(x) && !!x.__HighlandStreamError__;
-};
+export const isStreamError = (x: any): x is StreamError =>
+  isObject(x) && !!x.__HighlandStreamError__;
 
-_._isStreamRedirect = function (x) {
-  return _.isObject(x) && !!x.__HighlandStreamRedirect__;
-};
+export const isStreamRedirect = (x: any): x is StreamRedirect =>
+  isObject(x) && !!x.__HighlandStreamRedirect__;
 
 /**
  * Sends errors / data to consumers, observers and event handlers
@@ -1446,7 +1486,7 @@ Stream.prototype._removeObserver = function (s) {
  *             push(err);
  *             next();
  *         }
- *         else if (x === _.nil) {
+ *         else if (x === nil) {
  *             // pass nil (end event) along the stream
  *             push(null, x);
  *         }
@@ -1581,66 +1621,6 @@ Stream.prototype.pull = function (f) {
 };
 
 /**
- * Writes a value to the Stream. If the Stream is paused it will go into the
- * Stream's incoming buffer, otherwise it will be immediately processed and
- * sent to the Stream's consumers (if any). Returns false if the Stream is
- * paused, true otherwise. This lets Node's pipe method handle back-pressure.
- *
- * You shouldn't need to call this yourself, but it may be called by Node
- * functions which treat Highland Streams as a [Node Writable Stream](http://nodejs.org/api/stream.html#stream_class_stream_writable).
- *
- * Only call this function on streams that were constructed with no source
- * (i.e., with `_()`).
-
- * @id write
- * @section Stream Objects
- * @name Stream.write(x)
- * @param x - the value to write to the Stream
- * @api public
- *
- * var xs = _();
- * xs.write(1);
- * xs.write(2);
- * xs.end();
- *
- * xs.toArray(function (ys) {
- *     // ys will be [1, 2]
- * });
- *
- * // Do *not* do this.
- * var xs2 = _().toArray(_.log);
- * xs2.write(1); // This call is illegal.
- */
-
-Stream.prototype.write = function (x) {
-  if (this._nil_pushed) {
-    throw new Error("Cannot write to stream after nil");
-  }
-
-  // The check for _is_consumer is kind of a hack. Not
-  // needed in v3.0.
-  if (x === _.nil && !this._is_consumer) {
-    this._nil_pushed = true;
-  }
-
-  if (this.paused) {
-    this._incoming.push(x);
-  } else {
-    if (_._isStreamError(x)) {
-      this._send(x.error);
-    } else {
-      this._send(null, x);
-    }
-  }
-
-  if (this.paused) {
-    this._can_drain = true;
-  }
-
-  return !this.paused;
-};
-
-/**
  * Forks a stream, allowing you to add additional consumers with shared
  * back-pressure. A stream forked to multiple consumers will pull values, *one
  * at a time*, from its source as only fast as the slowest consumer can handle
@@ -1672,7 +1652,7 @@ Stream.prototype.write = function (x) {
  *   return _((push) => {
  *     setTimeout(() => {
  *       push(null, x);
- *       push(null, _.nil);
+ *       push(null, nil);
  *     }, ms);
  *   });
  * }
@@ -1748,7 +1728,7 @@ Stream.prototype.fork = function () {
  *   return _((push) => {
  *     setTimeout(() => {
  *       push(null, x);
- *       push(null, _.nil);
+ *       push(null, nil);
  *     }, ms);
  *   });
  * }
@@ -2166,7 +2146,7 @@ var warnMapWithValue = deprecate(
 );
 
 Stream.prototype.map = function (f) {
-  if (!_.isFunction(f)) {
+  if (!isFunction(f)) {
     warnMapWithValue();
     var val = f;
     f = function () {
@@ -2335,7 +2315,7 @@ Stream.prototype.pluck = function (prop) {
       next();
     } else if (x === nil) {
       push(err, x);
-    } else if (_.isObject(x)) {
+    } else if (isObject(x)) {
       push(null, x[prop]);
       next();
     } else {
@@ -2356,7 +2336,7 @@ exposeMethod("pluck");
  **/
 
 var objectOnly = _.curry(function (strategy, x) {
-  if (_.isObject(x)) {
+  if (isObject(x)) {
     return strategy(x);
   } else {
     throw new Error(
@@ -2543,7 +2523,7 @@ Stream.prototype.flatFilter = function (f) {
   function errorStream() {
     return _(function (push) {
       push(new Error("Stream returned by function was empty."));
-      push(null, _.nil);
+      push(null, nil);
     });
   }
 };
@@ -2663,7 +2643,7 @@ exposeMethod("findWhere");
  */
 
 Stream.prototype.group = function (f) {
-  var lambda = _.isString(f) ? _.get(f) : f;
+  var lambda = isString(f) ? _.get(f) : f;
   return this.reduce({}, function (m, o) {
     var key = lambda(o);
     if (!hasOwn.call(m, key)) m[key] = [];
@@ -2817,7 +2797,7 @@ exposeMethod("uniqBy");
  */
 
 Stream.prototype.uniq = function () {
-  if (!_.isUndefined(_global.Set)) {
+  if (!isUndefined(_global.Set)) {
     var uniques = new _global.Set(),
       size = uniques.size;
 
@@ -2890,7 +2870,7 @@ Stream.prototype.zipAll0 = function () {
       if (err) {
         push(err);
         nextValue(index, max, src, push, next);
-      } else if (x === _.nil) {
+      } else if (x === nil) {
         if (!finished) {
           finished = true;
           push(null, nil);
@@ -3113,7 +3093,7 @@ Stream.prototype.splitBy = function (sep) {
       push(err);
       next();
     } else if (x === nil) {
-      if (_.isString(buffer)) {
+      if (isString(buffer)) {
         drain(decoder.end(), push);
         push(null, buffer);
       }
@@ -3388,7 +3368,7 @@ exposeMethod("sort");
 Stream.prototype.through = function (target) {
   var output;
 
-  if (_.isFunction(target)) {
+  if (isFunction(target)) {
     return target(this);
   } else {
     output = _();
@@ -3443,7 +3423,7 @@ _.pipeline = function (/*through...*/) {
     return _();
   }
   var start = arguments[0], rest, startHighland;
-  if (!_.isStream(start) && !_.isFunction(start.resume)) {
+  if (!_.isStream(start) && !isFunction(start.resume)) {
     // not a Highland stream or Node stream, start with empty stream
     start = _();
     startHighland = start;
@@ -3758,7 +3738,7 @@ Stream.prototype.otherwise = function (ys) {
       next();
     } else if (x === nil) {
       // hit the end without redirecting to xs, use alternative
-      if (_.isFunction(ys)) {
+      if (isFunction(ys)) {
         next(ys());
       } else {
         next(ys);
@@ -3788,7 +3768,7 @@ Stream.prototype.append = function (y) {
   return this.consume(function (err, x, push, next) {
     if (x === nil) {
       push(null, y);
-      push(null, _.nil);
+      push(null, nil);
     } else {
       push(err, x);
       next();
@@ -3830,7 +3810,7 @@ Stream.prototype.reduce = function (z, f) {
   return this.consume(function (err, x, push, next) {
     if (x === nil) {
       push(null, z);
-      push(null, _.nil);
+      push(null, nil);
     } else if (err) {
       push(err);
       next();
@@ -3839,7 +3819,7 @@ Stream.prototype.reduce = function (z, f) {
         z = f(z, x);
       } catch (e) {
         push(e);
-        push(null, _.nil);
+        push(null, nil);
         return;
       }
 
@@ -3937,7 +3917,7 @@ Stream.prototype.scan = function (z, f) {
   return _([z]).concat(
     self.consume(function (err, x, push, next) {
       if (x === nil) {
-        push(null, _.nil);
+        push(null, nil);
       } else if (err) {
         push(err);
         next();
@@ -3946,7 +3926,7 @@ Stream.prototype.scan = function (z, f) {
           z = f(z, x);
         } catch (e) {
           push(e);
-          push(null, _.nil);
+          push(null, nil);
           return;
         }
 
@@ -4048,7 +4028,7 @@ Stream.prototype.transduce = function transduce(xf) {
       // Pass through errors, like we always do.
       push(err);
       next();
-    } else if (x === _.nil) {
+    } else if (x === nil) {
       // Push may be different from memo depending on the transducer that
       // we get.
       runResult(push, memo);
@@ -4074,7 +4054,7 @@ Stream.prototype.transduce = function transduce(xf) {
     } catch (e) {
       push(e);
     }
-    push(null, _.nil);
+    push(null, nil);
   }
 
   function runStep(push, _memo, x) {
@@ -4082,7 +4062,7 @@ Stream.prototype.transduce = function transduce(xf) {
       return transform["@@transducer/step"](_memo, x);
     } catch (e) {
       push(e);
-      push(null, _.nil);
+      push(null, nil);
       return null;
     }
   }
@@ -4454,7 +4434,7 @@ exposeMethod("throttle");
  * _(function (push, next) {
  *     delay(0, 100, push);
  *     delay(1, 200, push);
- *     delay(_.nil, 250, push);
+ *     delay(nil, 250, push);
  * }).debounce(75);
  * // => after 175ms => 1
  * // => after 250ms (not 275ms!) => 1 2
