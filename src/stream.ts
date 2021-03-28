@@ -1,7 +1,8 @@
 import { EventEmitter } from "https://deno.land/std@0.91.0/node/events.ts";
 import { Flattened } from "./flattened.ts";
-import { PConstructor } from "./p-constructor.ts";
 import { Nil } from "./interfaces.ts";
+import { InternalValue } from "./internal-value.ts";
+import { PConstructor } from "./p-constructor.ts";
 
 /**
  * Actual Stream constructor wrapped the the main exported function
@@ -74,7 +75,7 @@ export interface Stream<R> extends EventEmitter {
      * @param x - the value to write to the Stream
      * @api public
      */
-  write(x: R): boolean;
+  write(x: InternalValue<R>): boolean;
 
   // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
   // TRANSFORMS
@@ -102,7 +103,7 @@ export interface Stream<R> extends EventEmitter {
      *
      * _([1, 2, 3, 4, 5]).batch(2)  // => [1, 2], [3, 4], [5]
      */
-  batch(n: number): Stream<R[]>;
+  batch(n: number): Stream<Array<R>>;
 
   /**
      * Takes one Stream and batches incoming data within a maximum time frame
@@ -124,7 +125,7 @@ export interface Stream<R> extends EventEmitter {
      *
      * // => [1, 2], [3], [4]
      */
-  batchWithTimeOrCount(ms: number, n: number): Stream<R[]>;
+  batchWithTimeOrCount(ms: number, n: number): Stream<Array<R>>;
 
   /**
      * Groups all values into an Array and passes down the stream as a single
@@ -136,7 +137,7 @@ export interface Stream<R> extends EventEmitter {
      * @name Stream.collect()
      * @api public
      */
-  collect(): Stream<R[]>;
+  collect(): Stream<Array<R>>;
 
   /**
      * Filters a Stream to drop all non-truthy values.

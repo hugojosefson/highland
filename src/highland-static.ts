@@ -6,7 +6,6 @@
  * Copyright (c) Caolan McMahon
  *
  */
-import { EventEmitter } from "https://deno.land/std@0.91.0/node/events.ts";
 import { MappingHint, Nil } from "./interfaces.ts";
 import { Stream } from "./stream.ts";
 

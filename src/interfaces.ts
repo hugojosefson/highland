@@ -71,7 +71,7 @@ export interface PipeOptions {
   end: boolean;
 }
 
-export type MappingHint = number | string[] | Function;
+export type MappingHint = number | Array<string> | Function;
 
 export interface CleanupObject {
   onDestroy?: Function;
