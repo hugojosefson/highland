@@ -640,7 +640,7 @@ export interface Stream<R> extends EventEmitter {
 
   /**
      * Filters out all duplicate values from the stream and keeps only the first
-     * occurence of each value, using === to define equality.
+     * occurrence of each value, using === to define equality.
      *
      * @id uniq
      * @section Streams
@@ -651,7 +651,7 @@ export interface Stream<R> extends EventEmitter {
 
   /**
      * Filters out all duplicate values from the stream and keeps only the first
-     * occurence of each value, using the provided function to define equality.
+     * occurrence of each value, using the provided function to define equality.
      *
      * @id uniqBy
      * @section Streams
