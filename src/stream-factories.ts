@@ -1,6 +1,3 @@
-import { EventEmitter } from "https://deno.land/std@0.91.0/node/events.ts";
-import { MappingHint, OnFinished } from "./interfaces.ts";
-import { InternalValue } from "./internal-value.ts";
 import { Stream } from "./stream.ts";
 
 export interface StreamFactories<R> {
@@ -100,33 +97,4 @@ export interface StreamFactories<R> {
   (): Stream<R>;
 
   (source: Array<R>): Stream<R>;
-
-  (
-    source: (
-      push: (err: Error | null, x?: InternalValue<R>) => void,
-      next: () => void,
-    ) => void,
-  ): Stream<R>;
-
-  (source: Stream<R>): Stream<R>;
-
-  (
-    source: ReadableStream,
-    onFinished?: OnFinished,
-  ): Stream<R>;
-
-  (
-    source: string,
-    eventEmitter: EventEmitter,
-    mappingHint?: MappingHint,
-  ): Stream<R>;
-
-  // moar (promise for everything?)
-  (source: PromiseLike<Stream<R>>): Stream<R>;
-
-  (source: PromiseLike<R>): Stream<R>;
-
-  (source: Iterable<R>): Stream<R>;
-
-  (source: Iterator<R>): Stream<R>;
 }

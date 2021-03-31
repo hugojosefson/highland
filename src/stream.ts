@@ -1,64 +1,106 @@
 import { EventEmitter } from "https://deno.land/std@0.91.0/node/events.ts";
-import { Flattened } from "./flattened.ts";
-import { Nil } from "./interfaces.ts";
+import { setImmediate } from "https://deno.land/std@0.91.0/node/timers.ts";
+import { isUndefined } from "./index.ts";
+import { nil } from "./interfaces.ts";
 import { InternalValue } from "./internal-value.ts";
-import { PConstructor } from "./p-constructor.ts";
+
+const bindContext = <T>(fn: () => T, context: any): () => T =>
+  (...args: any) => fn.apply(context, args);
+
+export type ValueGenerator<R> = (
+  push: ValueGeneratorPush<R>,
+  next: ValueGeneratorNext<R>,
+) => void;
+
+export type ValueGeneratorPush<R> = <R>(
+  err: (Error | null | undefined),
+  x: R,
+) => void;
+
+export type ValueGeneratorNext<R> = <R>(s?: Stream<R>) => void;
 
 /**
  * Actual Stream constructor wrapped the the main exported function
  */
-export interface Stream<R> extends EventEmitter {
-  // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-  // STREAM OBJECTS
-  // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+export class Stream<R> extends EventEmitter {
+  /**
+     * Signals whether or not a call to write() returned false, and thus we can drain.
+     * This is only relevant for streams constructed with _().
+     * @private
+     */
+  private _can_drain: boolean = false;
+  /**
+     * Used by consume() to signal that next() hasn't been called, so resume()
+     * shouldn't ask for more data. Backpressure handling is getting fairly
+     * complicated, and this is very much a hack to get consume() backpressure
+     * to work correctly.
+     */
+  private _consume_waiting_for_next: boolean = false;
+  private _destructors: Array<Function> = [];
+  private _in_consume_cb: boolean = false;
+  private _incoming: Array<InternalValue<R>> = [];
+  private _is_consumer: boolean = false;
+  private _is_observer: boolean = false;
+  private _nil_pushed: boolean = false;
+  private _outgoing: Array<void> = [];
+  private _repeat_resume: boolean = false;
+  private _resume_running: boolean = false;
+  private _send_events: boolean = false;
+  private ended: boolean = false;
 
   /**
-     * Destroys a stream by unlinking it from any consumers and sources. This will
-     * stop all consumers from receiving events from this stream and removes this
-     * stream as a consumer of any source stream.
-     *
-     * This function calls end() on the stream and unlinks it from any piped-to streams.
-     *
-     * @id pipe
-     * @section Streams
-     * @name Stream.destroy()
-     * @api public
+     * used to detect Highland Streams using isStream(x), this
+     * will work even in cases where npm has installed multiple
+     * versions, unlike an instanceof check
      */
-  destroy(): void;
+  readonly __HighlandStream__: boolean = true;
+  _consumers: Array<Stream<R> | this> = [];
+  _delegate?: Stream<R> | this;
+  _observers: Array<Stream<R> | this> = [];
+  id: string = ("" + Math.random()).substr(2, 6);
+  paused: boolean = true;
+  source?: Stream<R>;
 
-  /**
-     * Ends a Stream. This is the same as sending a [nil](#nil) value as data.
-     * You shouldn't need to call this directly, rather it will be called by
-     * any [Node Readable Streams](http://nodejs.org/api/stream.html#stream_class_stream_readable)
-     * you pipe in.
-     *
-     * @id end
-     * @section Streams
-     * @name Stream.end()
-     * @api public
-     */
-  end(): void;
+  constructor(xs?: Array<R>) {
+    super();
 
-  /**
-     * Pauses the stream. All Highland Streams start in the paused state.
-     *
-     * @id pause
-     * @section Streams
-     * @name Stream.pause()
-     * @api public
-     */
-  pause(): void;
+    this.on("newListener", (ev) => {
+      if (ev === "data") {
+        this._send_events = true;
+        setImmediate(bindContext(this.resume, this));
+      } else if (ev === "end") {
+        // this property avoids us checking the length of the
+        // listeners subscribed to each event on each _send() call
+        this._send_events = true;
+      }
+    });
 
-  /**
-     * Resumes a paused Stream. This will either read from the Stream's incoming
-     * buffer or request more data from an upstream source.
-     *
-     * @id resume
-     * @section Streams
-     * @name Stream.resume()
-     * @api public
-     */
-  resume(): void;
+    // TODO: write test to cover this removeListener code
+    this.on("removeListener", (ev) => {
+      if (ev === "end" || ev === "data") {
+        const end_listeners = this.listeners("end").length;
+        const data_listeners = this.listeners("data").length;
+        if (end_listeners + data_listeners === 0) {
+          // stop emitting events
+          this._send_events = false;
+        }
+      }
+    });
+
+    if (isUndefined(xs)) {
+      // nothing else to do
+      return;
+    }
+
+    if (Array.isArray(xs)) {
+      this._incoming = [...xs, nil];
+      return;
+    }
+
+    throw new Error(
+      "Unexpected argument type to Stream(): " + (typeof xs),
+    );
+  }
 
   /**
      * Writes a value to the Stream. If the Stream is paused it will go into the
@@ -69,1102 +111,403 @@ export interface Stream<R> extends EventEmitter {
      * You shouldn't need to call this yourself, but it may be called by Node
      * functions which treat Highland Streams as a [Node Writable Stream](http://nodejs.org/api/stream.html#stream_class_stream_writable).
      *
+     * Only call this function on streams that were constructed with no source
+     * (i.e., with `_()`).
+
      * @id write
-     * @section Streams
+     * @section Stream Objects
      * @name Stream.write(x)
      * @param x - the value to write to the Stream
      * @api public
-     */
-  write(x: InternalValue<R>): boolean;
-
-  // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-  // TRANSFORMS
-  // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-
-  /**
-     * Adds a value to the end of a Stream.
      *
-     * @id append
-     * @section Streams
-     * @name Stream.append(y)
-     * @param y - the value to append to the Stream
-     * @api public
-     */
-  append(y: R): Stream<R>;
-
-  /**
-     * Takes one Stream and batches incoming data into arrays of given length
+     * var xs = _();
+     * xs.write(1);
+     * xs.write(2);
+     * xs.end();
      *
-     * @id batch
-     * @section Transforms
-     * @name Stream.batch(n)
-     * @param {Number} n - length of the array to batch
-     * @api public
-     *
-     * _([1, 2, 3, 4, 5]).batch(2)  // => [1, 2], [3, 4], [5]
-     */
-  batch(n: number): Stream<Array<R>>;
-
-  /**
-     * Takes one Stream and batches incoming data within a maximum time frame
-     * into arrays of a maximum length.
-     *
-     * @id batchWithTimeOrCount
-     * @section Transforms
-     * @name Stream.batchWithTimeOrCount(ms, n)
-     * @param {Number} ms - the maximum milliseconds to buffer a batch
-     * @param {Number} n - the maximum length of the array to batch
-     * @api public
-     *
-     * _(function (push) {
-     *     push(1);
-     *     push(2);
-     *     push(3);
-     *     setTimeout(push, 20, 4);
-     * }).batchWithTimeOrCount(10, 2)
-     *
-     * // => [1, 2], [3], [4]
-     */
-  batchWithTimeOrCount(ms: number, n: number): Stream<Array<R>>;
-
-  /**
-     * Groups all values into an Array and passes down the stream as a single
-     * data event. This is a bit like doing [toArray](#toArray), but instead
-     * of accepting a callback and causing a *thunk*, it passes the value on.
-     *
-     * @id collect
-     * @section Streams
-     * @name Stream.collect()
-     * @api public
-     */
-  collect(): Stream<Array<R>>;
-
-  /**
-     * Filters a Stream to drop all non-truthy values.
-     *
-     * @id compact
-     * @section Streams
-     * @name Stream.compact()
-     * @api public
-     */
-  compact(): Stream<R>;
-
-  /**
-     * Consumes values from a Stream (once resumed) and returns a new Stream for
-     * you to optionally push values onto using the provided push / next functions.
-     *
-     * This function forms the basis of many higher-level Stream operations.
-     * It will not cause a paused stream to immediately resume, but behaves more
-     * like a 'through' stream, handling values as they are read.
-     *
-     * @id consume
-     * @section Streams
-     * @name Stream.consume(f)
-     * @param {Function} f - the function to handle errors and values
-     * @api public
-     */
-  consume<U>(
-    f: (
-      err: Error,
-      x: R | Nil,
-      push: (err: Error | null, value?: U | Nil) => void,
-      next: () => void,
-    ) => void,
-  ): Stream<U>;
-
-  /**
-     * Holds off pushing data events downstream until there has been no more
-     * data for `ms` milliseconds. Sends the last value that occurred before
-     * the delay, discarding all other values.
-     *
-     * @id debounce
-     * @section Streams
-     * @name Stream.debounce(ms)
-     * @param {Number} ms - the milliseconds to wait before sending data
-     * @api public
-     */
-  debounce(ms: number): Stream<R>;
-
-  /**
-     * Creates a new Stream which applies a function to each value from the source
-     * and re-emits the source value. Useful when you want to mutate the value or
-     * perform side effects
-     *
-     * @id doto
-     * @section Transforms
-     * @name Stream.doto(f)
-     * @param {Function} f - the function to apply
-     * @api public
-     *
-     * var appended = _([[1], [2], [3], [4]]).doto(function (x) {
-     *     x.push(1);
+     * xs.toArray(function (ys) {
+     *     // ys will be [1, 2]
      * });
      *
-     * _([1, 2, 3]).doto(console.log)
-     * // 1
-     * // 2
-     * // 3
-     * // => 1, 2, 3
+     * // Do *not* do this.
+     * var xs2 = _().toArray(_.log);
+     * xs2.write(1); // This call is illegal.
      */
-  doto(f: (x: R) => void): Stream<R>;
+  write(x: InternalValue<R>): boolean {
+    if (this._nil_pushed) {
+      throw new Error("Cannot write to stream after nil");
+    }
+
+    // The check for _is_consumer is kind of a hack. Not needed in v3.0.
+    if (x === nil && !this._is_consumer) {
+      this._nil_pushed = true;
+    }
+
+    if (this.paused) {
+      this._incoming.push(x);
+    } else {
+      this._send(null, x);
+    }
+
+    if (this.paused) {
+      this._can_drain = true;
+    }
+
+    return !this.paused;
+  }
+
+  _resume(forceResumeSource: boolean) {
+    //console.log(['resume', this.id]);
+    if (this._resume_running || this._in_consume_cb) {
+      //console.log(['resume already processing _incoming buffer, ignore resume call']);
+      // already processing _incoming buffer, ignore resume call
+      this._repeat_resume = true;
+      return;
+    }
+    this._resume_running = true;
+    do {
+      // use a repeat flag to avoid recursing resume() calls
+      this._repeat_resume = false;
+      this.paused = false;
+
+      // send values from outgoing buffer first
+      this._sendOutgoing();
+
+      // send values from incoming buffer before reading from source
+      this._readFromBuffer();
+
+      // we may have paused while reading from buffer
+      if (!this.paused && !this._is_observer) {
+        // ask parent for more data
+        if (this.source) {
+          if (!this._consume_waiting_for_next || forceResumeSource) {
+            //console.log(['ask parent for more data']);
+            this.source._checkBackPressure();
+          }
+        } else {
+          if (this._can_drain) {
+            // perhaps a node stream is being piped in
+            this._can_drain = false;
+            this.emit("drain");
+          }
+        }
+      }
+    } while (this._repeat_resume);
+    this._resume_running = false;
+  }
 
   /**
-     * Acts as the inverse of [`take(n)`](#take) - instead of returning the first `n` values, it ignores the
-     * first `n` values and then emits the rest. `n` must be of type `Number`, if not the whole stream will
-     * be returned. All errors (even ones emitted before the nth value) will be emitted.
+     * Resumes a paused Stream. This will either read from the Stream's incoming
+     * buffer or request more data from an upstream source. Never call this method
+     * on a stream that has been consumed (via a call to [consume](#consume) or any
+     * other transform).
      *
-     * @id drop
-     * @section Transforms
-     * @name Stream.drop(n)
-     * @param {Number} n - integer representing number of values to read from source
+     * @id resume
+     * @section Stream Objects
+     * @name Stream.resume()
      * @api public
      *
-     * _([1, 2, 3, 4]).drop(2) // => 3, 4
+     * var xs = _(generator);
+     * xs.resume();
      */
-  drop(n: number): Stream<R>;
+  resume() {
+    this._resume(true);
+  }
 
   /**
-     * Extracts errors from a Stream and applies them to an error handler
-     * function. Returns a new Stream with the errors removed (unless the error
-     * handler chooses to rethrow them using `push`). Errors can also be
-     * transformed and put back onto the Stream as values.
-     *
-     * @id errors
-     * @section Streams
-     * @name Stream.errors(f)
-     * @param {Function} f - the function to pass all errors to
-     * @api public
+     * Starts pull values out of the incoming buffer and sending them downstream,
+     * this will exit early if this causes a downstream consumer to pause.
      */
-  errors(
-    f: (err: Error, push: (err: Error | null, x?: R) => void) => void,
-  ): Stream<R>;
+  _readFromBuffer() {
+    const len = this._incoming.length;
+    let i = 0;
+
+    while (i < len && !this.paused) {
+      const x = this._incoming[i];
+      this._send(null, x);
+      i++;
+    }
+    // remove processed data from _incoming buffer
+    this._incoming.splice(0, i);
+  }
 
   /**
-     * Creates a new Stream including only the values which pass a truth test.
-     *
-     * @id filter
-     * @section Streams
-     * @name Stream.filter(f)
-     * @param f - the truth test function
-     * @api public
+     * Starts pull values out of the incoming buffer and sending them downstream,
+     * this will exit early if this causes a downstream consumer to pause.
      */
-  filter<S extends R>(f: (x: R) => x is S): Stream<S>;
-
-  filter(f: (x: R) => boolean): Stream<R>;
+  _sendOutgoing() {
+    const len = this._outgoing.length;
+    let i = 0;
+    while (i < len && !this.paused) {
+      const x = this._outgoing[i];
+      Stream.prototype._send.call(this, null, x);
+      i++;
+    }
+    // remove processed data from _outgoing buffer
+    this._outgoing.splice(0, i);
+  }
 
   /**
-     * A convenient form of filter, which returns the first object from a
-     * Stream that passes the provided truth test
-     *
-     * @id find
-     * @section Streams
-     * @name Stream.find(f)
-     * @param {Function} f - the truth test function which returns a Stream
-     * @api public
+     * Sends errors / data to consumers, observers and event handlers
      */
-  find(f: (x: R) => boolean): Stream<R>;
+  _send(err: Error | null | undefined, x?: InternalValue<R>) {
+    if (x) {
+      if (this._consumers.length) {
+        const token = x;
+        // this._consumers may be changed from under us, so we keep a copy.
+        const consumers = [...this._consumers];
+        consumers.forEach((consumer) => consumer.write(token));
+      }
+      if (this._observers.length) {
+        const token = x;
+        // this._observers may be changed from under us, so we keep a copy.
+        const observers = [...this._observers];
+        observers.forEach((observer) => observer.write(token));
+      }
+    }
+    if (this._send_events) {
+      if (x === nil) {
+        this.emit("end");
+      } else {
+        this.emit("data", x);
+      }
+    }
+
+    if (x === nil) {
+      this._onEnd();
+    }
+  }
+
+  _onEnd() {
+    if (this.ended) {
+      return;
+    }
+
+    this.pause();
+    this.ended = true;
+
+    const source = this.source;
+    if (source) {
+      source._removeConsumer(this);
+      source._removeObserver(this);
+    }
+
+    // _removeConsumer may modify this._consumers.
+    const consumers = this._consumers;
+    consumers.forEach((consumer) => this._removeConsumer(consumer));
+
+    // Don't use _removeObserver for efficiency reasons.
+    this._observers
+      .filter((observer) => observer.source === this)
+      .forEach((observer) => observer.source = undefined);
+
+    this._destructors.forEach((destructor) => destructor.call(this));
+
+    this.source = undefined;
+    this._consumers = [];
+    this._incoming = [];
+    this._outgoing = [];
+    this._delegate = undefined;
+    this._observers = [];
+    this._destructors = [];
+  }
 
   /**
-     * A convenient form of [where](#where), which returns the first object from a
-     * Stream that matches a set of property values. findWhere is to [where](#where) as [find](#find) is to [filter](#filter).
+     * Pauses the stream. All Highland Streams start in the paused state.
      *
-     * @id findWhere
-     * @section Transforms
-     * @name Stream.findWhere(props)
-     * @param {Object} props - the properties to match against
-     * @api public
+     * It is unlikely that you will need to manually call this method.
      *
-     * var docs = [
-     *     {type: 'blogpost', title: 'foo'},
-     *     {type: 'blogpost', title: 'bar'},
-     *     {type: 'comment', title: 'foo'}
-     * ];
-     *
-     * _(docs).findWhere({type: 'blogpost'})
-     * // => {type: 'blogpost', title: 'foo'}
-     *
-     * // example with partial application
-     * var firstBlogpost = _.findWhere({type: 'blogpost'});
-     *
-     * firstBlogpost(docs)
-     * // => {type: 'blogpost', title: 'foo'}
-     */
-  findWhere(props: Partial<R>): Stream<R>;
-
-  /**
-     * A convenient form of reduce, which groups items based on a function or property name
-     *
-     * @id group
-     * @section Streams
-     * @name Stream.group(f)
-     * @param {Function|String} f - the function or property name on which to group,
-     *                              toString() is called on the result of a function.
-     * @api public
-     */
-  // TODO verify this
-  group(f: (x: R) => string): Stream<{ [prop: string]: R[] }>;
-
-  group(prop: string): Stream<{ [prop: string]: R[] }>;
-
-  /**
-     * Creates a new Stream with only the first value from the source.
-     *
-     * @id head
-     * @section Streams
-     * @name Stream.head()
-     * @api public
-     *
-     * _([1, 2, 3, 4]).head() // => 1
-     */
-  head(): Stream<R>;
-
-  /**
-     * Creates a new Stream with the separator interspersed between the elements of the source.
-     *
-     * `intersperse` is effectively the inverse of [splitBy](#splitBy).
-     *
-     * @id intersperse
-     * @section Transforms
-     * @name Stream.intersperse(sep)
-     * @param {R} separator - the value to intersperse between the source elements
-     * @api public
-     */
-  intersperse<U>(separator: U): Stream<R | U>;
-
-  /**
-     * Calls a named method on each object from the Stream - returning
-     * a new stream with the result of those calls.
-     *
-     * @id invoke
-     * @section Streams
-     * @name Stream.invoke(method, args)
-     * @param {String} method - the method name to call
-     * @param {Array} args - the arguments to call the method with
-     * @api public
-     */
-  invoke<U>(method: string, args: any[]): Stream<U>;
-
-  /**
-     * Drops all values from the Stream apart from the last one (if any).
-     *
-     * @id last
-     * @section Streams
-     * @name Stream.last()
-     * @api public
-     */
-  last(): Stream<R>;
-
-  /**
-     * Creates a new Stream, which when read from, only returns the last
-     * seen value from the source. The source stream does not experience
-     * back-pressure. Useful if you're using a Stream to model a changing
-     * property which you need to query periodically.
-     *
-     * @id latest
-     * @section Streams
-     * @name Stream.latest()
-     * @api public
-     */
-  latest(): Stream<R>;
-
-  /**
-     * Creates a new Stream of transformed values by applying a function to each
-     * value from the source. The transformation function can be replaced with
-     * a non-function value for convenience, and it will emit that value
-     * for every data event on the source Stream.
-     *
-     * @id map
-     * @section Streams
-     * @name Stream.map(f)
-     * @param f - the transformation function or value to map to
-     * @api public
-     */
-  map<U>(f: (x: R) => U): Stream<U>;
-
-  /**
-     *
-     * Retrieves copies of all elements in the collection,
-     * with only the whitelisted keys. If one of the whitelisted
-     * keys does not exist, it will be ignored.
-     *
-     * @id pick
-     * @section Transforms
-     * @name Stream.pick(properties)
-     * @param {Array} properties - property names to white filter
-     * @api public
-     */
-  pick<Prop extends keyof R>(props: Prop[]): Stream<Pick<R, Prop>>;
-
-  /**
-     *
-     * Retrieves copies of all the elements in the collection
-     * that satisfy a given predicate. Note: When using ES3,
-     * only enumerable elements are selected. Both enumerable
-     * and non-enumerable elements are selected when using ES5.
-     *
-     * @id pickBy
-     * @section Transforms
-     * @name Stream.pickBy(f)
-     * @param {Function} f - the predicate function
-     * @api public
-     */
-  pickBy<Prop extends keyof R>(
-    f: (key: Prop, value: R[Prop]) => boolean,
-  ): Stream<Partial<R>>;
-
-  /**
-     * Retrieves values associated with a given property from all elements in
-     * the collection.
-     *
-     * @id pluck
-     * @section Streams
-     * @name Stream.pluck(property)
-     * @param {String} prop - the property to which values should be associated
-     * @api public
-     */
-  pluck<Prop extends keyof R>(prop: Prop): Stream<R[Prop]>;
-
-  pluck<U>(prop: string): Stream<U>;
-
-  /**
-     * Limits number of values through the stream to a maximum of number of values
-     * per window. Errors are not limited but allowed to pass through as soon as
-     * they are read from the source.
-     *
-     * @id ratelimit
-     * @section Transforms
-     * @name Stream.ratelimit(num, ms)
-     * @param {Number} num - the number of operations to perform per window
-     * @param {Number} ms - the window of time to limit the operations in (in ms)
+     * @id pause
+     * @section Stream Objects
+     * @name Stream.pause()
      * @api public
      *
-     * _([1, 2, 3, 4, 5]).ratelimit(2, 100);
-     *
-     * // after 0ms => 1, 2
-     * // after 100ms => 1, 2, 3, 4
-     * // after 200ms => 1, 2, 3, 4, 5
+     * var xs = _(generator);
+     * xs.pause();
      */
-  ratelimit(num: number, ms: number): Stream<R>;
+  pause() {
+    this.paused = true;
+    const source = this.source;
+    if (!this._is_observer && source) {
+      source._checkBackPressure();
+    }
+  }
 
   /**
-     * Boils down a Stream to a single value. The memo is the initial state
-     * of the reduction, and each successive step of it should be returned by
-     * the iterator function. The iterator is passed two arguments:
-     * the memo and the next value.
-     *
-     * @id reduce
-     * @section Streams
-     * @name Stream.reduce(memo, iterator)
-     * @param memo - the initial state of the reduction
-     * @param {Function} iterator - the function which reduces the values
-     * @api public
+     * When there is a change in downstream consumers, it will often ask
+     * the parent Stream to re-check its state and pause/resume accordingly.
      */
-  reduce<U>(memo: U, iterator: (memo: U, x: R) => U): Stream<U>;
+  _checkBackPressure() {
+    if (
+      this._consumers.length === 0 ||
+      this._consumers.find((consumer) => consumer.paused)
+    ) {
+      this._repeat_resume = false;
+      this.pause();
+      return;
+    }
+
+    this._resume(false);
+  }
 
   /**
-     * Same as [reduce](#reduce), but uses the first element as the initial
-     * state instead of passing in a `memo` value.
+     * Ends a Stream. This is the same as sending a [nil](#nil) value as data.
+     * You shouldn't need to call this directly, rather it will be called by
+     * any [Node Readable Streams](http://nodejs.org/api/stream.html#stream_class_stream_readable)
+     * you pipe in.
      *
-     * @id reduce1
-     * @section Streams
-     * @name Stream.reduce1(iterator)
-     * @param {Function} iterator - the function which reduces the values
-     * @api public
-     */
-  reduce1<U>(iterator: (memo: R | U, x: R) => U): Stream<U>;
-
-  /**
-     * The inverse of [filter](#filter).
+     * Only call this function on streams that were constructed with no source
+     * (i.e., with `_()`).
      *
-     * @id reject
-     * @section Streams
-     * @name Stream.reject(f)
-     * @param {Function} f - the truth test function
+     * @id end
+     * @section Stream Objects
+     * @name Stream.end()
      * @api public
      *
-     * var odds = _([1, 2, 3, 4]).reject(function (x) {
-     *     return x % 2 === 0;
-     * });
+     * mystream.end();
      */
-  reject(f: (x: R) => boolean): Stream<R>;
+  end() {
+    if (this._nil_pushed) {
+      // Allow ending multiple times.
+      return;
+    }
+
+    this.write(nil);
+  }
 
   /**
-     * Like [reduce](#reduce), but emits each intermediate value of the
-     * reduction as it is calculated.
+     * Destroys a stream by unlinking it from any consumers and sources. This will
+     * stop all consumers from receiving events from this stream and removes this
+     * stream as a consumer of any source stream.
      *
-     * @id scan
-     * @section Streams
-     * @name Stream.scan(memo, iterator)
-     * @param memo - the initial state of the reduction
-     * @param {Function} iterator - the function which reduces the values
+     * This function calls end() on the stream and unlinks it from any piped-to streams.
+     *
+     * @id destroy
+     * @section Stream Objects
+     * @name Stream.destroy()
      * @api public
      */
-  scan<U>(memo: U, iterator: (memo: U, x: R) => U): Stream<U>;
+  destroy() {
+    if (this.ended) {
+      return;
+    }
+
+    if (!this._nil_pushed) {
+      this.end();
+    }
+
+    this._onEnd();
+  }
+
+  // --------------------------------------------------------
 
   /**
-     * Same as [scan](#scan), but uses the first element as the initial
-     * state instead of passing in a `memo` value.
-     *
-     * @id scan1
-     * @section Streams
-     * @name Stream.scan1(iterator)
-     * @param {Function} iterator - the function which reduces the values
-     * @api public
-     *
-     * _([1, 2, 3, 4]).scan1(add) // => 1, 3, 6, 10
+     * Adds a new consumer Stream, which will accept data and provide backpressure
+     * to this Stream. Adding more than one consumer will cause an exception to be
+     * thrown as the backpressure strategy must be explicitly chosen by the
+     * developer (through calling fork or observe).
      */
-  scan1<U>(iterator: (memo: R | U, x: R) => U): Stream<U>;
+  _addConsumer(s: Stream<R>) {
+    if (this._consumers.length) {
+      throw new Error(
+        "This stream has already been transformed or consumed. Please " +
+          "fork() or observe() the stream if you want to perform " +
+          "parallel transformations.",
+      );
+    }
+    s.source = this;
+    this._consumers.push(s);
+    this._checkBackPressure();
+  }
 
   /**
-     * Creates a new Stream with the values from the source in the range of `start` (inclusive) to `end` (exclusive).
-     * `start` and `end` must be of type `Number`, if `start` is not a `Number` it will default to `0`
-     * and, likewise, `end` will default to `Infinity`: this could result in the whole stream being be
-     * returned.
-     *
-     * @id slice
-     * @section Transforms
-     * @name Stream.slice(start, end)
-     * @param {Number} start - integer representing index to start reading from source (inclusive)
-     * @param {Number} end - integer representing index to stop reading from source (exclusive)
-     * @api public
+     * Removes a consumer from this Stream.
      */
-  slice(start: number, end: number): Stream<R>;
+  _removeConsumer(s: Stream<R>) {
+    let src: Stream<R> | this = this;
+    while (src._delegate) {
+      src = src._delegate;
+    }
+    src._consumers = src._consumers.filter((c) => c !== s);
+    if (s.source === src) {
+      s.source = undefined;
+    }
+    src._checkBackPressure();
+  }
 
   /**
-     * Collects all values together then emits each value individually but in sorted order.
-     * The method for sorting the elements is ascending lexical.
-     *
-     * @id sort
-     * @section Transforms
-     * @name Stream.sort()
-     * @api public
-     *
-     * var sorted = _(['b', 'z', 'g', 'r']).sort().toArray(_.log);
-     * // => ['b', 'g', 'r', 'z']
+     * Removes an observer from this Stream.
      */
-  sort(): Stream<R>;
+  _removeObserver(observerToRemoveFromThis: this | Stream<R>) {
+    this._observers = this._observers.filter((observer) =>
+      observer !== observerToRemoveFromThis
+    );
+    if (observerToRemoveFromThis.source === this) {
+      observerToRemoveFromThis.source = undefined;
+    }
+  }
 
   /**
-     * Collects all values together then emits each value individually in sorted
-     * order. The method for sorting the elements is defined by the comparator
-     * function supplied as a parameter.
+     * Observes a stream, allowing you to handle values as they are emitted,
+     * without adding back-pressure or causing data to be pulled from the source.
+     * Unlike [forks](#fork), observers are passive. They don't affect each other
+     * or the source stream. They only observe data as the source stream emits
+     * them.
      *
-     * The comparison function takes two arguments `a` and `b` and should return
-     *
-     * - a negative number if `a` should sort before `b`.
-     * - a positive number if `a` should sort after `b`.
-     * - zero if `a` and `b` may sort in any order (i.e., they are equal).
-     *
-     * This function must also define a [partial
-     * order](https://en.wikipedia.org/wiki/Partially_ordered_set). If it does not,
-     * the resulting ordering is undefined.
-     *
-     * @id sortBy
-     * @section Transforms
-     * @name Stream.sortBy(f)
-     * @param {Function} f - the comparison function
-     * @api public
-     */
-  sortBy(f: (a: R, b: R) => number): Stream<R>;
-
-  /**
-     * [splitBy](#splitBy) over newlines.
-     *
-     * @id split
-     * @section Transforms
-     * @name Stream.split()
-     * @api public
-     */
-  split(this: Stream<string>): Stream<string>;
-
-  /**
-     * Splits the source Stream by a separator and emits the pieces in between, much like splitting a string.
-     *
-     * `splitBy` is effectively the inverse of [intersperse](#intersperse).
-     *
-     * @id splitBy
-     * @section Transforms
-     * @name Stream.splitBy(sep)
-     * @param {String | RegExp} sep - the separator to split on
-     * @api public
-     */
-  splitBy(this: Stream<string>, sep: string | RegExp): Stream<string>;
-
-  /**
-     * Like the [errors](#errors) method, but emits a Stream end marker after
-     * an Error is encountered.
-     *
-     * @id stopOnError
-     * @section Streams
-     * @name Stream.stopOnError(f)
-     * @param {Function} f - the function to handle an error
-     * @api public
-     */
-  stopOnError(f: (err: Error) => void): Stream<R>;
-
-  /**
-     * Creates a new Stream with the first `n` values from the source.
-     *
-     * @id take
-     * @section Streams
-     * @name Stream.take(n)
-     * @param {Number} n - integer representing number of values to read from source
-     * @api public
-     */
-  take(n: number): Stream<R>;
-
-  /**
-     * An alias for the [doto](#doto) method.
-     *
-     * @id tap
-     * @section Transforms
-     * @name Stream.tap(f)
-     * @param {Function} f - the function to apply
-     * @api public
-     *
-     * _([1, 2, 3]).tap(console.log)
-     */
-  tap(f: (x: R) => void): Stream<R>;
-
-  /**
-     * Ensures that only one data event is push downstream (or into the buffer)
-     * every `ms` milliseconds, any other values are dropped.
-     *
-     * @id throttle
-     * @section Streams
-     * @name Stream.throttle(ms)
-     * @param {Number} ms - the minimum milliseconds between each value
-     * @api public
-     */
-  throttle(ms: number): Stream<R>;
-
-  /**
-     * Filters out all duplicate values from the stream and keeps only the first
-     * occurrence of each value, using === to define equality.
-     *
-     * @id uniq
-     * @section Streams
-     * @name Stream.uniq()
-     * @api public
-     */
-  uniq(): Stream<R>;
-
-  /**
-     * Filters out all duplicate values from the stream and keeps only the first
-     * occurrence of each value, using the provided function to define equality.
-     *
-     * @id uniqBy
-     * @section Streams
-     * @name Stream.uniqBy()
-     * @api public
-     */
-  uniqBy(f: (a: R, b: R) => boolean): Stream<R>;
-
-  /**
-     * A convenient form of filter, which returns all objects from a Stream
-     * match a set of property values.
-     *
-     * @id where
-     * @section Streams
-     * @name Stream.where(props)
-     * @param {Object} props - the properties to match against
-     * @api public
-     */
-  where(props: Partial<R>): Stream<R>;
-
-  // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-  // HIGHER-ORDER STREAMS
-  // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-
-  /**
-     * Concatenates a Stream to the end of this Stream.
-     *
-     * Be aware that in the top-level export, the args may be in the reverse
-     * order to what you'd expect `_([a], [b]) => [b, a]`, as this follows the
-     * convention of other top-level exported functions which do `x` to `y`.
-     *
-     * @id concat
-     * @section Streams
-     * @name Stream.concat(ys)
-     * @params {Stream | Array} ys - the values to concatenate onto this Stream
-     * @api public
-     */
-  concat(ys: Stream<R>): Stream<R>;
-
-  concat(ys: R[]): Stream<R>;
-
-  /**
-     * Filters using a predicate which returns a Stream. If you need to check
-     * against an asynchronous data source when filtering a Stream, this can
-     * be convenient. The Stream returned from the filter function should have
-     * a Boolean as it's first value (all other values on the Stream will be
-     * disregarded).
-     *
-     * @id flatFilter
-     * @section Streams
-     * @name Stream.flatFilter(f)
-     * @param {Function} f - the truth test function which returns a Stream
-     * @api public
-     */
-  flatFilter(f: (x: R) => Stream<boolean>): Stream<R>;
-
-  /**
-     * Creates a new Stream of values by applying each item in a Stream to an
-     * iterator function which must return a (possibly empty) Stream. Each
-     * item on these result Streams are then emitted on a single output Stream.
-     *
-     * This transform is functionally equivalent to `.map(f).sequence()`.
-     *
-     * @id flatMap
-     * @section Streams
-     * @name Stream.flatMap(f)
-     * @param {Function} f - the iterator function
-     * @api public
-     */
-  flatMap<U>(f: (x: R) => Stream<U>): Stream<U>;
-
-  flatMap<U>(f: (x: R) => U): Stream<U>;
-
-  /**
-     * Recursively reads values from a Stream which may contain nested Streams
-     * or Arrays. As values or errors are encountered, they are emitted on a
-     * single output Stream.
-     *
-     * @id flatten
-     * @section Streams
-     * @name Stream.flatten()
-     * @api public
-     */
-  flatten<U extends Flattened<R>>(): Stream<U>;
-
-  /**
-     * Forks a stream, allowing you to add additional consumers with shared
-     * back-pressure. A stream forked to multiple consumers will only pull values
-     * from it's source as fast as the slowest consumer can handle them.
-     *
-     * @id fork
-     * @section Streams
-     * @name Stream.fork()
-     * @api public
-     */
-  fork(): Stream<R>;
-
-  /**
-     * Takes a Stream of Streams and merges their values and errors into a
-     * single new Stream. The merged stream ends when all source streams have
-     * ended.
-     *
-     * Note that no guarantee is made with respect to the order in which
-     * values for each stream end up in the merged stream. Values in the
-     * merged stream will, however, respect the order they were emitted from
-     * their respective streams.
-     *
-     * @id merge
-     * @section Streams
-     * @name Stream.merge()
-     * @api public
-     *
-     * var txt = _(['foo.txt', 'bar.txt']).map(readFile)
-     * var md = _(['baz.md']).map(readFile)
-     *
-     * _([txt, md]).merge();
-     * // => contents of foo.txt, bar.txt and baz.txt in the order they were read
-     */
-  merge<U>(this: Stream<Stream<U>>): Stream<U>;
-
-  /**
-     * Takes a Stream of Streams and merges their values and errors into a
-     * single new Stream, limitting the number of unpaused streams that can
-     * running at any one time.
-     *
-     * Note that no guarantee is made with respect to the order in which
-     * values for each stream end up in the merged stream. Values in the
-     * merged stream will, however, respect the order they were emitted from
-     * their respective streams.
-     *
-     * @id mergeWithLimit
-     * @section Higher-order Streams
-     * @name Stream.mergeWithLimit(n)
-     * @param {Number} n - the maximum number of streams to run in parallel
-     * @api public
-     *
-     * var readFile = _.wrapCallback(fs.readFile);
-     *
-     * var txt = _(['foo.txt', 'bar.txt']).flatMap(readFile)
-     * var md = _(['baz.md']).flatMap(readFile)
-     * var js = _(['bosh.js']).flatMap(readFile)
-     *
-     * _([txt, md, js]).mergeWithLimit(2);
-     * // => contents of foo.txt, bar.txt, baz.txt and bosh.js in the order
-     * // they were read, but bosh.js is not read until either foo.txt and bar.txt
-     * // has completely been read or baz.md has been read
-     */
-  mergeWithLimit<U>(this: Stream<Stream<U>>, n: number): Stream<U>;
-
-  /**
-     * Observes a stream, allowing you to handle values as they are emitted, without
-     * adding back-pressure or causing data to be pulled from the source. This can
-     * be useful when you are performing two related queries on a stream where one
-     * would block the other. Just be aware that a slow observer could fill up it's
-     * buffer and cause memory issues. Where possible, you should use [fork](#fork).
+     * Observers will buffer data that it sees from the source, so an observer that
+     * cannot process the data as fast as the source produces it can end up
+     * consuming a lot of memory.
      *
      * @id observe
-     * @section Streams
+     * @section Higher-order Streams
      * @name Stream.observe()
      * @api public
-     */
-  observe(): Stream<R>;
-
-  /**
-     * Switches source to an alternate Stream if the current Stream is empty.
      *
-     * @id otherwise
-     * @section Streams
-     * @name Stream.otherwise(ys)
-     * @param {Stream} ys - alternate stream to use if this stream is empty
-     * @api public
-     */
-  otherwise(ys: Stream<R>): Stream<R>;
-
-  /**
-     * Takes a Stream of Streams and reads from them in parallel, buffering
-     * the results until they can be returned to the consumer in their original
-     * order.
-     *
-     * @id parallel
-     * @section Streams
-     * @name Stream.parallel(n)
-     * @param {Number} n - the maximum number of concurrent reads/buffers
-     * @api public
-     */
-  parallel<U>(this: Stream<Stream<U>>, n: number): Stream<U>;
-
-  /**
-     * Reads values from a Stream of Streams, emitting them on a Single output
-     * Stream. This can be thought of as a flatten, just one level deep. Often
-     * used for resolving asynchronous actions such as a HTTP request or reading
-     * a file.
-     *
-     * @id sequence
-     * @section Streams
-     * @name Stream.sequence()
-     * @api public
-     */
-  sequence<U>(this: Stream<Stream<U>>): Stream<U>;
-
-  sequence<U>(this: Stream<U[]>): Stream<U>;
-
-  /**
-     * An alias for the [sequence](#sequence) method.
-     *
-     * @id series
-     * @section Streams
-     * @name Stream.series()
-     * @api public
-     */
-  series<U>(this: Stream<Stream<U>>): Stream<U>;
-
-  series<U>(this: Stream<U[]>): Stream<U>;
-
-  /**
-     * Transforms a stream using an arbitrary target transform.
-     *
-     * If `target` is a function, this transform passes the current Stream to it,
-     * returning the result.
-     *
-     * If `target` is a [Duplex
-     * Stream](https://nodejs.org/api/stream.html#stream_class_stream_duplex_1),
-     * this transform pipes the current Stream through it. It will always return a
-     * Highland Stream (instead of the piped to target directly as in
-     * [pipe](#pipe)). Any errors emitted will be propagated as Highland errors.
-     *
-     * **TIP**: Passing a function to `through` is a good way to implement complex
-     * reusable stream transforms. You can even construct the function dynamically
-     * based on certain inputs. See examples below.
-     *
-     * @id through
-     * @section Higher-order Streams
-     * @name Stream.through(target)
-     * @param {Function | Duplex Stream} target - the stream to pipe through or a
-     * function to call.
-     * @api public
-     *
-     * // This is a static complex transform.
-     * function oddDoubler(s) {
-     *     return s.filter(function (x) {
-     *         return x % 2; // odd numbers only
-     *     })
-     *     .map(function (x) {
-     *         return x * 2;
-     *     });
+     * function delay(x, ms) {
+     *   return _((push) => {
+     *     setTimeout(() => {
+     *       push(null, x);
+     *       push(null, nil);
+     *     }, ms);
+     *   });
      * }
      *
-     * // This is a dynamically-created complex transform.
-     * function multiplyEvens(factor) {
-     *     return function (s) {
-     *         return s.filter(function (x) {
-     *             return x % 2 === 0;
-     *         })
-     *         .map(function (x) {
-     *             return x * factor;
-     *         });
-     *     };
-     * }
+     * const then = Date.now();
      *
-     * _([1, 2, 3, 4]).through(oddDoubler); // => 2, 6
+     * const source = _([1, 2, 3, 4])
+     *     .tap((x) => console.log(`source: ${x} (${Date.now() - then})`));
+     * const obs = source.observe().flatMap((x) => delay(x, 1000));
+     * const main = source.flatMap((x) => delay(x, 10));
      *
-     * _([1, 2, 3, 4]).through(multiplyEvens(5)); // => 10, 20
+     * // obs will not receive any data yet, since it is only a passive
+     * // observer.
+     * obs.each((x) => console.log(`obs   : ${x} (${Date.now() - then})`));
      *
-     * // Can also be used with Node Through Streams
-     * _(filenames).through(jsonParser).map(function (obj) {
-     *     // ...
-     * });
+     * // Now both obs and main will receive data as fast as main can handle it.
+     * // Even though since obs is very slow, main will still receive all of the
+     * // source's data.
+     * main.each((x) => console.log(`main  : ${x} (${Date.now() - then})`));
      *
-     * // All errors will be propagated as Highland errors
-     * _(['zz{"a": 1}']).through(jsonParser).errors(function (err) {
-     *   console.log(err); // => SyntaxError: Unexpected token z
-     * });
+     * // =>
+     * // source: 1 (3)
+     * // main  : 1 (21)
+     * // source: 2 (22)
+     * // main  : 2 (33)
+     * // source: 3 (37)
+     * // main  : 3 (47)
+     * // source: 4 (47)
+     * // main  : 4 (57)
+     * // obs   : 1 (1010)
+     * // obs   : 2 (2012)
+     * // obs   : 3 (3018)
+     * // obs   : 4 (4052)
      */
-  through<U>(f: (x: Stream<R>) => U): U;
-
-  through(thru: ReadableStream & WritableStream): Stream<any>;
-
-  /**
-     * Takes two Streams and returns a Stream of corresponding pairs.
-     *
-     * @id zip
-     * @section Streams
-     * @name Stream.zip(ys)
-     * @param {Array | Stream} ys - the other stream to combine values with
-     * @api public
-     */
-  zip<U>(ys: U[]): Stream<[R, U]>;
-
-  zip<U>(ys: Stream<U>): Stream<[R, U]>;
-
-  /**
-     * Takes a stream and a *finite* stream of `N` streams
-     * and returns a stream of the corresponding `(N+1)`-tuples.
-     *
-     * *Note:* This transform will be renamed `zipEach` in the next major version
-     * release.
-     *
-     * @id zipAll
-     * @section Higher-order Streams
-     * @name Stream.zipAll(ys)
-     * @param {Array | Stream} ys - the array of streams to combine values with
-     * @api public
-     */
-  zipAll<U>(ys: U[][]): Stream<Array<R | U>>;
-
-  zipAll<U>(ys: Stream<U[]>): Stream<Array<R | U>>;
-
-  zipAll<U>(ys: Stream<Stream<U>>): Stream<Array<R | U>>;
-
-  /**
-     * Takes a *finite* stream of streams and returns a stream where the first
-     * element from each separate stream is combined into a single data event,
-     * followed by the second elements of each stream and so on until the shortest
-     * input stream is exhausted.
-     *
-     * *Note:* This transform will be renamed `zipAll` in the next major version
-     * release.
-     *
-     * @id zipAll0
-     * @section Higher-order Streams
-     * @name Stream.zipAll0()
-     * @api public
-     */
-  zipAll0<T>(this: Stream<Stream<T>>): Stream<T[]>;
-
-  // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-  // CONSUMPTION
-  // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-
-  /**
-     * Applies results from a Stream as arguments to a function
-     *
-     * @id apply
-     * @section Streams
-     * @name Stream.apply(f)
-     * @param {Function} f - the function to apply arguments to
-     * @api public
-     */
-  // TODO what to do here?
-  apply(f: Function): void;
-
-  /**
-     * Calls a function once the Stream has ended. This method consumes the stream.
-     * If the Stream has already ended, the function is called immediately.
-     *
-     * If an error from the Stream reaches this call, it will emit an `error` event
-     * (i.e., it will call `emit('error')` on the stream being consumed).  This
-     * event will cause an error to be thrown if unhandled.
-     *
-     * As a special case, it is possible to chain `done` after a call to
-     * [each](#each) even though both methods consume the stream.
-     *
-     * @id done
-     * @section Consumption
-     * @name Stream.done(f)
-     * @param {Function} f - the callback
-     * @api public
-     *
-     * var total = 0;
-     * _([1, 2, 3, 4]).each(function (x) {
-     *     total += x;
-     * }).done(function () {
-     *     // total will be 10
-     * });
-     */
-  done(f: () => void): void;
-
-  /**
-     * Iterates over every value from the Stream, calling the iterator function
-     * on each of them. This function causes a **thunk**.
-     *
-     * If an error from the Stream reaches the `each` call, it will emit an
-     * error event (which will cause it to throw if unhandled).
-     *
-     * @id each
-     * @section Streams
-     * @name Stream.each(f)
-     * @param {Function} f - the iterator function
-     * @api public
-     */
-  each(f: (x: R) => void): Pick<Stream<R>, "done">;
-
-  /**
-     * Pipes a Highland Stream to a [Node Writable
-     * Stream](http://nodejs.org/api/stream.html#stream_class_stream_writable).
-     * This will pull all the data from the source Highland Stream and write it to
-     * the destination, automatically managing flow so that the destination is not
-     * overwhelmed by a fast source.
-     *
-     * Users may optionally pass an object that may contain any of these fields:
-     *
-     * - `end` - Ends the destination when this stream ends. Default: `true`. This
-     *   option has no effect if the destination is either `process.stdout` or
-     *   `process.stderr`. Those two streams are never ended.
-     *
-     * Like [Readable#pipe](https://nodejs.org/api/stream.html#stream_readable_pipe_destination_options),
-     * this function will throw errors if there is no `error` handler installed on
-     * the stream.
-     *
-     * This function returns the destination so you can chain together `pipe` calls.
-     *
-     * **NOTE**: While Highland streams created via `_()` and [pipeline](#pipeline)
-     * support being piped to, it is almost never appropriate to `pipe` from a
-     * Highland stream to another Highland stream. Those two cases are meant for
-     * use when piping from *Node* streams. You might be tempted to use `pipe` to
-     * construct reusable transforms. Do not do it. See [through](#through) for a
-     * better way.
-     *
-     * @id pipe
-     * @section Consumption
-     * @name Stream.pipe(dest, options)
-     * @param {Writable Stream} dest - the destination to write all data to
-     * @param {Object} options - (optional) pipe options.
-     * @api public
-     */
-  pipe<U>(dest: Stream<U>): Stream<U>;
-
-  pipe<U extends WritableStream>(dest: U, options?: { end?: boolean }): U;
-
-  /**
-     * Consumes a single item from the Stream. Unlike consume, this function will
-     * not provide a new stream for you to push values onto, and it will unsubscribe
-     * as soon as it has a single error, value or nil from the source.
-     *
-     * You probably won't need to use this directly, but it is used internally by
-     * some functions in the Highland library.
-     *
-     * @id pull
-     * @section Streams
-     * @name Stream.pull(f)
-     * @param {Function} f - the function to handle data
-     * @api public
-     */
-  pull(f: (err: Error, x: R | Nil) => void): void;
-
-  /**
-     * Collects all values from a Stream into an Array and calls a function with
-     * once with the result. This function causes a **thunk**.
-     *
-     * If an error from the Stream reaches the `toArray` call, it will emit an
-     * error event (which will cause it to throw if unhandled).
-     *
-     * @id toArray
-     * @section Streams
-     * @name Stream.toArray(f)
-     * @param {Function} f - the callback to provide the completed Array to
-     * @api public
-     */
-  toArray(f: (arr: R[]) => void): void;
-
-  /**
-     * Returns the result of a stream to a nodejs-style callback function.
-     *
-     * If the stream contains a single value, it will call `cb`
-     * with the single item emitted by the stream (if present).
-     * If the stream is empty, `cb` will be called without any arguments.
-     * If an error is encountered in the stream, this function will stop
-     * consumption and call `cb` with the error.
-     * If the stream contains more than one item, it will stop consumption
-     * and call `cb` with an error.
-     *
-     * @id toCallback
-     * @section Consumption
-     * @name Stream.toCallback(cb)
-     * @param {Function} cb - the callback to provide the error/result to
-     * @api public
-     *
-     * _([1, 2, 3, 4]).collect().toCallback(function (err, result) {
-     *     // parameter result will be [1,2,3,4]
-     *     // parameter err will be null
-     * });
-     */
-  toCallback(cb: (err?: Error, x?: R) => void): void;
-
-  /**
-     * Converts the stream to a node Readable Stream for use in methods
-     * or pipes that depend on the native stream type.
-     *
-     * The options parameter can be an object passed into the [`Readable`
-     * constructor](http://nodejs.org/api/stream.html#stream_class_stream_readable).
-     *
-     * @id toNodeStream
-     * @section Consumption
-     * @name Stream.toNodeStream(options)
-     * @param {Object} options - (optional) [`Readable` constructor](http://nodejs.org/api/stream.html#stream_class_stream_readable) options
-     * @api public
-     *
-     * _(fs.createReadStream('./abc')).toNodeStream()
-     * _(fs.createReadStream('./abc')).toNodeStream({objectMode: false})
-     * _([{a: 1}]).toNodeStream({objectMode: true})
-     */
-  toNodeStream(options?: object): ReadableStream;
-
-  /**
-     * Converts the result of a stream to Promise.
-     *
-     * If the stream contains a single value, it will return
-     * with the single item emitted by the stream (if present).
-     * If the stream is empty, `undefined` will be returned.
-     * If an error is encountered in the stream, this function will stop
-     * consumption and call `cb` with the error.
-     * If the stream contains more than one item, it will stop consumption
-     * and reject with an error.
-     *
-     * @id toPromise
-     * @section Consumption
-     * @name Stream.toPromise(PromiseCtor)
-     * @param {Function} PromiseCtor - Promises/A+ compliant constructor
-     * @api public
-     *
-     * _([1, 2, 3, 4]).collect().toPromise(Promise).then(function (result) {
-     *     // parameter result will be [1,2,3,4]
-     * });
-     */
-  toPromise<P extends PromiseLike<R>>(PromiseCtor: PConstructor<R, P>): P;
+  observe() {
+    const s = new Stream<R>();
+    s.id = "observe:" + s.id;
+    s.source = this;
+    s._is_observer = true;
+    this._observers.push(s);
+    return s;
+  }
 }

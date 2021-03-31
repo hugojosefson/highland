@@ -1,5 +1,3 @@
-import { Stream } from "./stream.ts";
-
 /**
  * The end of stream marker. This is sent along the data channel of a Stream
  * to tell consumers that the Stream has ended. See the example map code for
@@ -41,43 +39,3 @@ class NilImpl implements Nil {
   }
 }
 export const nil: Nil = new NilImpl();
-
-// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-//
-// /**
-//      * Used as an Error marker when writing to a Stream's incoming buffer
-//      */
-// // TODO is this public?
-// class StreamError {
-//   constructor(err: Error);
-//
-//   error: Error;
-// }
-//
-// /**
-//      * Used as a Redirect marker when writing to a Stream's incoming buffer
-//      */
-// // TODO is this public?
-// class StreamRedirect<R> {
-//   constructor(to: Stream<R>);
-//
-//   to: Stream<R>;
-// }
-// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-
-export interface PipeableStream<T, R> extends Stream<R> {}
-
-export interface PipeOptions {
-  end: boolean;
-}
-
-export type MappingHint = number | Array<string> | Function;
-
-export interface CleanupObject {
-  onDestroy?: Function;
-  continueOnError?: boolean;
-}
-export type OnFinished = (
-  r: ReadableStream,
-  cb: (...args: any[]) => void,
-) => void | Function | CleanupObject;

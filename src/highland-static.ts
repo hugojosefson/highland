@@ -6,7 +6,7 @@
  * Copyright (c) Caolan McMahon
  *
  */
-import { MappingHint, Nil } from "./interfaces.ts";
+import { Nil } from "./interfaces.ts";
 import { Stream } from "./stream.ts";
 
 export interface HighlandStatic {
@@ -64,35 +64,6 @@ export interface HighlandStatic {
      */
   nil: Nil;
 
-  /**
-     * Wraps a node-style async function which accepts a callback, transforming
-     * it to a function which accepts the same arguments minus the callback and
-     * returns a Highland Stream instead. The wrapped function keeps its context,
-     * so you can safely use it as a method without binding (see the second
-     * example below).
-     *
-     * wrapCallback also accepts an optional mappingHint, which specifies how
-     * callback arguments are pushed to the stream. This can be used to handle
-     * non-standard callback protocols that pass back more than one value.
-     *
-     * mappingHint can be a function, number, or array. See the documentation on
-     * EventEmitter Stream Objects for details on the mapping hint. If
-     * mappingHint is a function, it will be called with all but the first
-     * argument that is passed to the callback. The first is still assumed to be
-     * the error argument.
-     *
-     * @id wrapCallback
-     * @section Utils
-     * @name _.wrapCallback(f)
-     * @param {Function} f - the node-style function to wrap
-     * @param {Array | Function | Number} [mappingHint] - how to pass the arguments to the callback
-     * @api public
-     */
-  wrapCallback(
-    f: Function,
-    mappingHint?: MappingHint,
-  ): (...args: any[]) => Stream<any>;
-
   // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
   // OBJECTS
   // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
@@ -106,12 +77,11 @@ export interface HighlandStatic {
      * @id extend
      * @section Objects
      * @name _.extend(a, b)
-     * @param {Object} a - the properties to extend b with
-     * @param {Object} b - the original object to extend
+     * @param {Object} extensions - the properties to extend b with
+     * @param {Object} target - the original object to extend
      * @api public
      */
   extend(extensions: Object, target: Object): Object;
-
   extend(target: Object): (extensions: Object) => Object;
 
   /**
@@ -125,7 +95,6 @@ export interface HighlandStatic {
      * @api public
      */
   get(prop: string, obj: Object): string;
-
   get(prop: string): (obj: Object) => Object;
 
   /**
@@ -152,7 +121,6 @@ export interface HighlandStatic {
      * @api public
      */
   pairs(obj: Object): Stream<any[]>;
-
   pairs(obj: any[]): Stream<any[]>;
 
   /**
@@ -167,7 +135,6 @@ export interface HighlandStatic {
      * @api public
      */
   set(prop: string, val: any, obj: Object): Object;
-
   set(prop: string, val: any): (obj: Object) => Object;
 
   /**
